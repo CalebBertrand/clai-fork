@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Test script for the overlayfs runner functionality.
+run `sudo python3 -m CLAI.sandbox.test_runner` from the parent dir of the repo
 """
 
 import os
