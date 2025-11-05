@@ -1,4 +1,7 @@
+from typing import TYPE_CHECKING
 
+if TYPE_CHECKING:
+    from ..sandbox import Sandbox
 
 class Prompter:
     """Handles interactive prompting with sandbox isolation."""
