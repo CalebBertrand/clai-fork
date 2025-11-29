@@ -1,10 +1,11 @@
 from typing import TYPE_CHECKING
 
 from prompt_toolkit import PromptSession
-from prompt_toolkit.shortcuts import print_formatted_text
+
+from llm.translator import Translator
 
 if TYPE_CHECKING:
-    from ..sandbox import Sandbox
+    from CLAI.sandbox import Sandbox
 
 
 class Prompter:
@@ -20,7 +21,8 @@ class Prompter:
         """
         self.sandbox = sandbox
         self.exit_sequence = exit_sequence
-        self.session = PromptSession()
+        self.session: PromptSession = PromptSession()
+        self.translator = Translator()
 
     def run_interactive_session(self) -> None:
         """
@@ -44,8 +46,11 @@ class Prompter:
                     if user_input == self.exit_sequence:
                         break
 
-                    command_args = user_input.split()
-                    self.sandbox.run_command(command_args)
+                    if user_input.startswith("/") and user_input != self.exit_sequence:
+                        self._handle_ai_prompt(user_input[1:])  # Remove the leading /
+                    else:
+                        command_args = user_input.split()
+                        self.sandbox.run_command(command_args)
 
                 except KeyboardInterrupt:
                     print(f"\nUse '{self.exit_sequence}' to exit.")
@@ -68,6 +73,33 @@ class Prompter:
                 self.sandbox.cleanup(keep_changes=False)
             raise
 
+    def _handle_ai_prompt(self, nl_prompt: str) -> None:
+        """
+        Handle natural language prompting mode.
+
+        Args:
+            nl_prompt: The natural language prompt from the user
+        """
+        try:
+            plan = self.translator.to_plan(nl_prompt)
+
+            print(f"\nExplanation: {plan.get('explain', 'No explanation provided')}")
+
+            if plan.get("needs_clarification", False):
+                question = plan.get("question", "Additional clarification needed")
+                print(f"\nClarification needed: {question}")
+                return
+
+            command = plan.get("command", [])
+            if command:
+                print(f"Executing: {' '.join(command)}")
+                self.sandbox.run_command(command)
+            else:
+                print("No command generated")
+
+        except Exception as e:
+            print(f"AI translation error: {e}")
+
     def _show_welcome_banner(self) -> None:
         """Display a welcome banner for the CLAI shell."""
         banner = """
@@ -87,6 +119,7 @@ class Prompter:
     ║                                                                                ║
     ║              Commands:                                                         ║
     ║                • Type commands as you would in a normal shell                  ║
+    ║                • Start with '/' for natural language AI prompting              ║
     ║                • Press Ctrl+C to interrupt                                     ║
     ║                • Type '/exit' to quit                                          ║
     ║                                                                                ║

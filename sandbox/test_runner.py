@@ -5,11 +5,11 @@ run `sudo python3 -m CLAI.sandbox.test_runner` from the parent dir of the repo
 """
 
 import os
-from .overlayfs import OverlayFS
-from ..shell import Prompter
+from CLAI.sandbox.overlayfs import OverlayFS
+from CLAI.shell import Prompter
 
 
-def main():
+def main() -> None:
     """Example usage of the interactive overlayfs runner."""
 
     test_dir = os.getcwd()

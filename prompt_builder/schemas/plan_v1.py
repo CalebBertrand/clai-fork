@@ -4,7 +4,7 @@ PLAN_FN_NAME = "emit_plan_v1"
 PLAN_JSON_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["version", "intent", "command", "cwd", "inputs", "outputs", "explain"],
+    "required": ["version", "intent", "command", "cwd", "inputs", "outputs", "explain", "needs_clarification", "question"],
     "properties": {
         "version": {"type": "string", "enum": [PLAN_VERSION]},
         "intent": {"type": "string", "minLength": 1},

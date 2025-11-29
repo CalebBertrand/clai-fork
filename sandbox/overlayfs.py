@@ -75,7 +75,23 @@ class OverlayFS(Sandbox):
         if not self.mounted:
             raise RuntimeError("OverlayFS is not mounted")
 
-        return subprocess.run(command, cwd=self.merged_dir)
+        fake_bin_dir = os.path.join(self.temp_root, "fake_bin")
+        os.makedirs(fake_bin_dir, exist_ok=True)
+
+        pwd_wrapper = os.path.join(fake_bin_dir, "pwd")
+        with open(pwd_wrapper, "w") as f:
+            f.write(f'#!/bin/sh\necho "{self.base_dir}"\n')
+        os.chmod(pwd_wrapper, 0o755)
+
+        env = os.environ.copy()
+        env["PWD"] = self.base_dir
+        env["OVERLAY_BASE_DIR"] = self.base_dir
+        env["PATH"] = f"{fake_bin_dir}:{env.get('PATH', '/usr/bin:/bin')}"
+
+        pwd_func = f'pwd() {{ echo "{self.base_dir}"; }}'
+        cmd_str = f'export PWD="{self.base_dir}"; {pwd_func}; {" ".join(command)}'
+
+        return subprocess.run(["bash", "-c", cmd_str], cwd=self.merged_dir, env=env)
 
     def cleanup(self, keep_changes: bool = False) -> None:
         """
