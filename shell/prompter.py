@@ -1,3 +1,4 @@
+import sys
 from typing import TYPE_CHECKING
 
 from prompt_toolkit import PromptSession
@@ -38,7 +39,13 @@ class Prompter:
 
             while True:
                 try:
-                    user_input = self.session.prompt("clai> ").strip()
+                    try:
+                        current_dir = self.sandbox.get_pwd()
+                        prompt_text = f"clai:{current_dir}> "
+                    except Exception:
+                        prompt_text = "clai> "
+
+                    user_input = self.session.prompt(prompt_text).strip()
 
                     if not user_input:
                         continue
@@ -50,7 +57,13 @@ class Prompter:
                         self._handle_ai_prompt(user_input[1:])  # Remove the leading /
                     else:
                         command_args = user_input.split()
-                        self.sandbox.run_command(command_args)
+                        result = self.sandbox.run_command(command_args)
+
+                        # Print stdout and stderr to terminal
+                        if result.get("stdout"):
+                            print(result["stdout"].decode(), end="")
+                        if result.get("stderr"):
+                            print(result["stderr"].decode(), end="", file=sys.stderr)
 
                 except KeyboardInterrupt:
                     print(f"\nUse '{self.exit_sequence}' to exit.")
@@ -88,17 +101,31 @@ class Prompter:
             if plan.get("needs_clarification", False):
                 question = plan.get("question", "Additional clarification needed")
                 print(f"\nClarification needed: {question}")
+                # Add clarification to conversation history
+                self.translator.add_execution_context(
+                    f"Clarification needed: {question}"
+                )
                 return
 
             command = plan.get("command", [])
             if command:
                 print(f"Executing: {' '.join(command)}")
-                self.sandbox.run_command(command)
+                result = self.sandbox.run_command(command)
+                # Add execution result to conversation history
+                execution_info = f"Command executed: {' '.join(command)}"
+                if hasattr(result, "returncode"):
+                    execution_info += f" (exit code: {result.returncode})"
+                self.translator.add_execution_context(execution_info)
             else:
                 print("No command generated")
+                self.translator.add_execution_context(
+                    "No command was generated from the request"
+                )
 
         except Exception as e:
-            print(f"AI translation error: {e}")
+            error_msg = f"AI translation error: {e}"
+            print(error_msg)
+            self.translator.add_execution_context(error_msg)
 
     def _show_welcome_banner(self) -> None:
         """Display a welcome banner for the CLAI shell."""

@@ -26,3 +26,7 @@ class Translator:
                 outdir: Path = Path("plans")) -> Path:
         plan = self.to_plan(nl_request, extra_context=extra_context)
         return write_plan_to_file(plan, outdir)
+    
+    def add_execution_context(self, context_info: str) -> None:
+        """Add execution context to conversation history."""
+        self.backend.add_execution_context(context_info)

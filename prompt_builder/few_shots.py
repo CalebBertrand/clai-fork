@@ -13,16 +13,12 @@ FEW_SHOTS = [
                 "type": "function",
                 "function": {
                     "name": "emit_plan_v1",
-                    "arguments": '{"version": "1.0", "intent": "file_search", "command": ["bash", "-lc", "find . -type f -name \'*.py\' -mtime -7 -size +10M -print"], "cwd": ".", "inputs": [], "outputs": [], "explain": "Find *.py changed in 7 days and larger than 10MB.", "needs_clarification": false, "question": ""}',
+                    "arguments": '{"version": "1.0", "intent": "file_search", "command": ["find", ".", "-type f", "-name \'*.py\'", "-mtime -7", "-size +10M", "-print"], "cwd": ".", "inputs": [], "outputs": [], "explain": "Find *.py changed in 7 days and larger than 10MB.", "needs_clarification": false, "question": ""}',
                 },
             }
         ],
     },
-    {
-        "role": "tool",
-        "tool_call_id": "tool_1",
-        "content": "Plan executed successfully"
-    },
+    {"role": "tool", "tool_call_id": "tool_1", "content": "Plan executed successfully"},
     {
         "role": "user",
         "content": "delete the big logs",
@@ -35,14 +31,10 @@ FEW_SHOTS = [
                 "type": "function",
                 "function": {
                     "name": "emit_plan_v1",
-                    "arguments": '{"version": "1.0", "intent": "file_delete", "command": ["bash", "-lc", "echo \'awaiting confirmation\'"], "cwd": ".", "inputs": [], "outputs": [], "explain": "Deletion is destructive; request scope/confirmation first.", "needs_clarification": true, "question": "Which directory and size threshold? Preview first?"}',
+                    "arguments": '{"version": "1.0", "intent": "file_delete", "command": ["echo" "\'awaiting confirmation\'"], "cwd": ".", "inputs": [], "outputs": [], "explain": "Deletion is destructive; request scope/confirmation first.", "needs_clarification": true, "question": "Which directory and size threshold? Preview first?"}',
                 },
             }
         ],
     },
-    {
-        "role": "tool", 
-        "tool_call_id": "tool_2",
-        "content": "Plan executed successfully"
-    },
+    {"role": "tool", "tool_call_id": "tool_2", "content": "Plan executed successfully"},
 ]

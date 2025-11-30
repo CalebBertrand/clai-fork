@@ -7,10 +7,9 @@ Rules:
 1) Return ONLY valid JSON that conforms to the provided JSON Schema.
 2) Prefer safe, read-only operations. If the user intent implies write/delete/permission change,
    set "needs_clarification": true with a short, specific question.
-3) Use argv arrays (no shell metacharacters unless wrapped in ["bash","-lc", "..."]).
-4) Avoid globbing or expansion in argv unless using find/grep safely in a controlled string.
-5) Do not include any hidden reasoning or explanations outside the "explain" field.
-6) If paths are unclear, assume current directory "." and ask for clarification.
+3) Avoid globbing or expansion in argv unless using find/grep safely in a controlled string.
+4) Do not include any hidden reasoning or explanations outside the "explain" field.
+5) If paths are unclear, assume current directory "." and ask for clarification.
 
 Environment assumptions:
 - Unix-like shell available (bash).

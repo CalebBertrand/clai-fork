@@ -46,6 +46,7 @@ class OpenAITranslator:
             raise RuntimeError("Install the SDK: pip install openai>=1.40")
         self.client = OpenAI(base_url=base_url or os.environ.get("OPENAI_BASE_URL"))
         self.model = model or os.environ.get("CLAI_OPENAI_MODEL", "gpt-4.1-mini")
+        self.conversation_history = []
 
     def translate(
         self, nl_request: str, extra_context: Optional[dict] = None
@@ -53,6 +54,7 @@ class OpenAITranslator:
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             *FEW_SHOTS,
+            *self.conversation_history,
             {"role": "user", "content": self._format_user(nl_request, extra_context)},
         ]
 
@@ -76,9 +78,35 @@ class OpenAITranslator:
 
         plan = self._extract_plan_args(resp)
         self._validate_basic(plan)
+
+        # Store conversation history
+        user_message = {
+            "role": "user",
+            "content": self._format_user(nl_request, extra_context),
+        }
+        assistant_message = {
+            "role": "assistant",
+            "content": f"Generated plan: {plan.get('explain', 'Command executed')}",
+        }
+
+        self.conversation_history.extend([user_message, assistant_message])
+
+        if len(self.conversation_history) > 20:
+            self.conversation_history = self.conversation_history[-20:]
+
         return TranslationResult(plan=plan, raw_response=_to_dict(resp))
 
-    # ---------- helpers ----------
+    def add_execution_context(self, context_info: str) -> None:
+        """Add execution context information to conversation history."""
+        context_message = {
+            "role": "assistant",
+            "content": f"Execution context: {context_info}",
+        }
+        self.conversation_history.append(context_message)
+
+        if len(self.conversation_history) > 20:
+            self.conversation_history = self.conversation_history[-20:]
+
     def _format_user(self, nl_request: str, extra: Optional[dict]) -> str:
         if not extra:
             return nl_request
