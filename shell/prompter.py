@@ -1,12 +1,14 @@
 import sys
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List
 
 from prompt_toolkit import PromptSession
+from rich.console import Console
 
-from llm.translator import Translator
+from CLAI.llm.translator import Translator
+from CLAI.shell.diff_display import display_changes
 
 if TYPE_CHECKING:
-    from CLAI.sandbox import Sandbox
+    from CLAI.sandbox import Sandbox, ChangedFile
 
 
 class Prompter:
@@ -24,6 +26,7 @@ class Prompter:
         self.exit_sequence = exit_sequence
         self.session: PromptSession = PromptSession()
         self.translator = Translator()
+        self.console = Console()
 
     def run_interactive_session(self) -> None:
         """
@@ -73,8 +76,14 @@ class Prompter:
                 except Exception as e:
                     print(f"Error: {e}")
 
+            # Get changed files once and reuse for display and cleanup
+            changed_files = self.sandbox.get_changed_files()
+
+            # Show diff before asking about changes
+            display_changes(changed_files, self.console)
+
             keep_changes = self._prompt_keep_changes()
-            self.sandbox.cleanup(keep_changes)
+            self.sandbox.cleanup(keep_changes, changed_files)
 
             if keep_changes:
                 print("Changes kept.")

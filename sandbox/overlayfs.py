@@ -9,56 +9,78 @@ import tempfile
 import shutil
 import stat
 import glob
+import base64
+import shlex
+from dataclasses import dataclass
+from enum import Enum
 from typing import List, Optional, Set, Any
 from .sandbox import Sandbox
 
 
+class ChangeType(Enum):
+    """Type of change detected in the overlay."""
+
+    ADDED = "added"
+    MODIFIED = "modified"
+    DELETED = "deleted"
+
+
+@dataclass
+class ChangedFile:
+    """Represents a file that was changed in the overlay."""
+
+    path: str  # Path relative to the lower directory
+    change_type: ChangeType
+    upper_path: str  # Full path in the upper directory
+    lower_path: str  # Full path in the lower directory (original)
+
+
 # Default sensitive paths to hide (absolute paths that will be filtered to base_dir)
 DEFAULT_SENSITIVE_PATHS = [
-    # # Password and authentication files
+    # Password and authentication files
     "/etc/shadow",
     "/etc/gshadow",
     "/etc/sudoers",
     "/etc/sudoers.d",
     "/etc/security/opasswd",
     # SSH keys and config
-    # "/etc/ssh/ssh_host_*",
-    # "/root/.ssh",
+    "/etc/ssh/ssh_host_*",
+    "/root/.ssh",
     "/home/*/.ssh",
-    # # Shell history and secrets
-    # "/root/.bash_history",
-    # "/root/.zsh_history",
-    # "/root/.python_history",
-    # "/home/*/.bash_history",
-    # "/home/*/.zsh_history",
-    # "/home/*/.python_history",
-    # # GPG and crypto
-    # "/root/.gnupg",
-    # "/home/*/.gnupg",
-    # # Cloud credentials
-    # "/root/.aws",
-    # "/root/.azure",
-    # "/root/.config/gcloud",
-    # "/home/*/.aws",
-    # "/home/*/.azure",
-    # "/home/*/.config/gcloud",
-    # # Environment files that may contain secrets
-    # "/etc/environment",
-    # # Kubernetes
-    # "/root/.kube",
-    # "/home/*/.kube",
-    # # Docker
-    # "/root/.docker/config.json",
-    # "/home/*/.docker/config.json",
-    # # Password managers and keyrings
-    # "/root/.local/share/keyrings",
-    # "/home/*/.local/share/keyrings",
-    # # Git credentials
-    # "/root/.git-credentials",
-    # "/home/*/.git-credentials",
-    # # netrc files
-    # "/root/.netrc",
-    # "/home/*/.netrc",
+    # Shell history and secrets
+    "/root/.bash_history",
+    "/root/.zsh_history",
+    "/root/.python_history",
+    "/home/*/.bash_history",
+    "/home/*/.zsh_history",
+    "/home/*/.python_history",
+    # GPG and crypto
+    "/root/.gnupg",
+    "/home/*/.gnupg",
+    # Cloud credentials
+    "/root/.aws",
+    "/root/.azure",
+    "/root/.config/gcloud",
+    "/home/*/.aws",
+    "/home/*/.azure",
+    "/home/*/.config/gcloud",
+    # Environment files that may contain secrets
+    "/etc/environment",
+    # Kubernetes
+    "/root/.kube",
+    "/home/*/.kube",
+    # Docker
+    "/root/.docker/config.json",
+    "/home/*/.docker/config.json",
+    # Password managers and keyrings
+    "/root/.local/share/keyrings",
+    "/home/*/.local/share/keyrings",
+    # Git credentials
+    "/root/.git-credentials",
+    "/home/*/.git-credentials",
+    # netrc files
+    "/root/.netrc",
+    "/home/*/.netrc",
 ]
 
 
@@ -155,13 +177,12 @@ class OverlayFS(Sandbox):
         env["PWD"] = self.current_dir
         env["OVERLAY_BASE_DIR"] = self.base_dir
 
-        # Escape single quotes in paths and command for shell safety
-        merged_dir_escaped = self.merged_dir.replace("'", "'\\''")
-        # Inside the chroot, use the absolute path to current_dir (same as on real system)
-        current_dir_escaped = self.current_dir.replace("'", "'\\''")
-
-        # Join command parts, escaping single quotes
-        command_escaped = " ".join(part.replace("'", "'\\''") for part in command)
+        # Build the inner script that will run inside the chroot
+        # Using base64 encoding avoids all nested quoting issues
+        inner_script = f"""cd {shlex.quote(self.current_dir)} && {" ".join(command)}
+echo "FINAL_PWD:$(pwd)"
+"""
+        encoded_script = base64.b64encode(inner_script.encode()).decode()
 
         # Chroot into the merged overlayfs view which contains the full root filesystem.
         # This provides defense in depth:
@@ -170,9 +191,9 @@ class OverlayFS(Sandbox):
         #    they can't escape because they're already chrooted into the overlay)
         # Note: Submounts (like /home) are overlaid during __init__ via _bind_submounts()
         cmd_str = f"""
-        set -e
-        chroot '{merged_dir_escaped}' bash -c "cd '{current_dir_escaped}' && {command_escaped} && echo FINAL_PWD:\$(pwd)"
-        """
+set -e
+chroot {shlex.quote(self.merged_dir)} bash -c "eval $(echo {encoded_script} | base64 -d)"
+"""
 
         result = subprocess.run(
             ["unshare", "-m", "bash", "-c", cmd_str],
@@ -394,17 +415,26 @@ class OverlayFS(Sandbox):
             # Can't read the directory
             pass
 
-    def cleanup(self, keep_changes: bool = False) -> None:
+    def cleanup(
+        self, keep_changes: bool = False, changed_files: List[ChangedFile] | None = None
+    ) -> None:
         """
         Clean up all overlays and optionally copy changes to their base directories.
+
         Args:
             keep_changes: If True, copy changes from each upper layer to its base directory
+            changed_files: Optional pre-computed list of changed files to avoid re-traversing.
+                          If None and keep_changes=True, will traverse to find changes.
         """
         try:
             if keep_changes and self.mounted:
-                # Apply changes from each overlay's upper layer to its lower layer
-                for upper_dir, lower_dir, _ in self.overlay_mounts:
-                    self._apply_overlay_changes(upper_dir, lower_dir)
+                if changed_files is not None:
+                    # Use provided list to apply changes without re-traversing
+                    self._apply_changes_from_list(changed_files)
+                else:
+                    # Fall back to traversing each overlay
+                    for upper_dir, lower_dir, _ in self.overlay_mounts:
+                        self._apply_overlay_changes(upper_dir, lower_dir)
         finally:
             if self.mounted:
                 # Unmount in reverse order (submounts first, then root)
@@ -495,6 +525,36 @@ class OverlayFS(Sandbox):
                     # Skip files we can't copy (might be special files)
                     continue
 
+    def _apply_changes_from_list(self, changed_files: List[ChangedFile]) -> None:
+        """
+        Apply changes using a pre-computed list of ChangedFile objects.
+
+        This avoids re-traversing the filesystem when we already have the list
+        of changed files (e.g., from displaying the diff to the user).
+
+        Args:
+            changed_files: List of ChangedFile objects to apply
+        """
+        # Process deletions first
+        for cf in changed_files:
+            if cf.change_type == ChangeType.DELETED:
+                try:
+                    if os.path.exists(cf.lower_path):
+                        os.remove(cf.lower_path)
+                except (OSError, PermissionError):
+                    continue
+
+        # Process additions and modifications
+        for cf in changed_files:
+            if cf.change_type in (ChangeType.ADDED, ChangeType.MODIFIED):
+                try:
+                    # Ensure parent directory exists
+                    parent_dir = os.path.dirname(cf.lower_path)
+                    os.makedirs(parent_dir, exist_ok=True)
+                    shutil.copy2(cf.upper_path, cf.lower_path)
+                except (OSError, PermissionError):
+                    continue
+
     def get_pwd(self) -> str:
         """
         Get the current working directory visible in the sandbox.
@@ -503,6 +563,90 @@ class OverlayFS(Sandbox):
             Current working directory path
         """
         return self.current_dir
+
+    def get_changed_files(self) -> List[ChangedFile]:
+        """
+        Get a list of all files changed in the overlay.
+
+        Traverses each overlay's upper directory to find added, modified,
+        and deleted files. This list can be reused by cleanup() to avoid
+        re-traversing the filesystem.
+
+        Returns:
+            List of ChangedFile objects representing all changes
+        """
+        changed_files: List[ChangedFile] = []
+
+        for upper_dir, lower_dir, _ in self.overlay_mounts:
+            changed_files.extend(self._get_changes_for_overlay(upper_dir, lower_dir))
+
+        return changed_files
+
+    def _get_changes_for_overlay(
+        self, upper_dir: str, lower_dir: str
+    ) -> List[ChangedFile]:
+        """
+        Get changed files for a single overlay mount.
+
+        Args:
+            upper_dir: The overlay's upper directory containing changes
+            lower_dir: The original lower directory
+
+        Returns:
+            List of ChangedFile objects for this overlay
+        """
+        changes: List[ChangedFile] = []
+
+        for root, dirs, files in os.walk(upper_dir):
+            rel_root = os.path.relpath(root, upper_dir)
+            if rel_root == ".":
+                rel_root = ""
+
+            for file_name in files:
+                rel_path = os.path.join(rel_root, file_name) if rel_root else file_name
+                upper_path = os.path.join(root, file_name)
+                lower_path = os.path.join(lower_dir, rel_path)
+
+                # Skip files that were hidden by us (sensitive paths)
+                # These are whiteouts we created, not user deletions
+                if lower_path in self.hidden_paths:
+                    continue
+
+                # Check if this is a whiteout file (indicates deletion)
+                try:
+                    file_stat = os.lstat(upper_path)
+                    if stat.S_ISCHR(file_stat.st_mode):
+                        # Whiteout file - this file was deleted
+                        # Only report if the original file exists
+                        if os.path.exists(lower_path):
+                            changes.append(
+                                ChangedFile(
+                                    path=rel_path,
+                                    change_type=ChangeType.DELETED,
+                                    upper_path=upper_path,
+                                    lower_path=lower_path,
+                                )
+                            )
+                        continue
+                except (OSError, PermissionError):
+                    continue
+
+                # Regular file - check if it's new or modified
+                if os.path.exists(lower_path):
+                    change_type = ChangeType.MODIFIED
+                else:
+                    change_type = ChangeType.ADDED
+
+                changes.append(
+                    ChangedFile(
+                        path=rel_path,
+                        change_type=change_type,
+                        upper_path=upper_path,
+                        lower_path=lower_path,
+                    )
+                )
+
+        return changes
 
     def _fix_permissions_and_retry_cleanup(self) -> None:
         """Fix permissions and retry cleanup of temp directories."""
