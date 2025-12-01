@@ -28,6 +28,17 @@ class Prompter:
         self.translator = Translator()
         self.console = Console()
 
+    def _run_command(self, command: List[str]):
+        result = self.sandbox.run_command(command)
+
+        # Print stdout and stderr to terminal
+        if result.get("stdout"):
+            print(result["stdout"].decode(), end="")
+        if result.get("stderr"):
+            print(result["stderr"].decode(), end="", file=sys.stderr)
+
+        return result
+
     def run_interactive_session(self) -> None:
         """
         Run an interactive shell session in sandbox isolation.
@@ -59,14 +70,7 @@ class Prompter:
                     if user_input.startswith("/") and user_input != self.exit_sequence:
                         self._handle_ai_prompt(user_input[1:])  # Remove the leading /
                     else:
-                        command_args = user_input.split()
-                        result = self.sandbox.run_command(command_args)
-
-                        # Print stdout and stderr to terminal
-                        if result.get("stdout"):
-                            print(result["stdout"].decode(), end="")
-                        if result.get("stderr"):
-                            print(result["stderr"].decode(), end="", file=sys.stderr)
+                        self._run_command(user_input.split())
 
                 except KeyboardInterrupt:
                     print(f"\nUse '{self.exit_sequence}' to exit.")
@@ -119,8 +123,8 @@ class Prompter:
             command = plan.get("command", [])
             if command:
                 print(f"Executing: {' '.join(command)}")
-                result = self.sandbox.run_command(command)
-                # Add execution result to conversation history
+                result = self._run_command(command)
+
                 execution_info = f"Command executed: {' '.join(command)}"
                 if hasattr(result, "returncode"):
                     execution_info += f" (exit code: {result.returncode})"
