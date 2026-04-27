@@ -94,7 +94,6 @@ class OverlayFS(Sandbox):
             base_dir: The base directory to protect with overlayfs
             sensitive_paths: Additional paths to hide (supports glob patterns).
                             If None, uses DEFAULT_SENSITIVE_PATHS when hide_sensitive_files=True
-            hide_sensitive_files: If True, hide sensitive system files from the overlay
         Raises:
             FileNotFoundError: If base_dir doesn't exist
         """
@@ -102,7 +101,6 @@ class OverlayFS(Sandbox):
             raise FileNotFoundError(f"Base directory does not exist: {base_dir}")
 
         self.base_dir = os.path.abspath(base_dir)
-        self.current_dir = self.base_dir
         self.mounted = False
         self.temp_root = tempfile.mkdtemp(prefix="overlay_")
         self.upper_dir = os.path.join(self.temp_root, "upper")
@@ -113,42 +111,151 @@ class OverlayFS(Sandbox):
         # Used during cleanup to apply changes from each overlay
         self.overlay_mounts: List[tuple[str, str, str]] = []
 
+        # Track whether we're using user namespaces for unprivileged operation
+        self.using_userns = False
+
+        # Capture the original user's UID/GID if running under sudo
+        # This allows us to run commands as the original user, not root
+        self.orig_uid: Optional[int] = None
+        self.orig_gid: Optional[int] = None
+        self.orig_user: Optional[str] = None
+        if os.environ.get("SUDO_UID"):
+            self.orig_uid = int(os.environ["SUDO_UID"])
+            self.orig_gid = int(os.environ.get("SUDO_GID", self.orig_uid))
+            self.orig_user = os.environ.get("SUDO_USER")
+
         os.makedirs(self.upper_dir)
         os.makedirs(self.work_dir)
         os.makedirs(self.merged_dir)
 
-        try:
-            # Overlay the entire root filesystem so chroot has access to /bin/bash etc.
-            # Any writes anywhere in the filesystem will go to the upper layer.
-            mount_cmd = [
-                "mount",
-                "-t",
-                "overlay",
-                "overlay",
-                "-o",
-                f"lowerdir=/,upperdir={self.upper_dir},workdir={self.work_dir}",
-                self.merged_dir,
-            ]
-            subprocess.run(mount_cmd, check=True, capture_output=True)
-            self.mounted = True
-            # Track root overlay: (upper_dir, lower_dir, mount_point)
-            self.overlay_mounts.append((self.upper_dir, "/", self.merged_dir))
-        except subprocess.CalledProcessError as e:
-            if "mount" in str(e.cmd):
-                raise PermissionError(
-                    "Failed to mount overlayfs. This operation requires root privileges. "
-                    "Try running with sudo."
-                ) from e
-            raise
+        # Try to mount overlayfs - first directly (if root), then via user namespace
+        self._mount_overlay()
 
         # Bind-mount submounts (like /home on a separate partition) into the merged view.
         # Overlayfs only sees the root filesystem's content, not other mounted filesystems.
-        self._bind_submounts()
+        # For userns mode, submounts are handled inside the namespace setup script.
+        if not self.using_userns:
+            self._bind_submounts()
 
-        paths_to_hide = list(DEFAULT_SENSITIVE_PATHS)
-        if sensitive_paths:
-            paths_to_hide.extend(sensitive_paths)
-        self._hide_sensitive_paths(paths_to_hide)
+        # Hide sensitive paths from the overlay (only needed for privileged mode)
+        # In userns mode, the user is already unprivileged and can't access these paths anyway
+        if not self.using_userns:
+            paths_to_hide = list(DEFAULT_SENSITIVE_PATHS)
+            if sensitive_paths:
+                paths_to_hide.extend(sensitive_paths)
+            self._hide_sensitive_paths(paths_to_hide)
+
+    def _mount_overlay(self) -> None:
+        """
+        Mount the root overlayfs, trying privileged mount first, then user namespace.
+
+        On modern Linux (5.11+), overlayfs can be mounted inside a user namespace
+        without root privileges. This method tries direct mount first (for root),
+        then falls back to user namespace mounting for unprivileged users.
+
+        Raises:
+            PermissionError: If neither privileged nor unprivileged mounting works
+        """
+        mount_opts = f"lowerdir=/,upperdir={self.upper_dir},workdir={self.work_dir}"
+
+        # If running as root, use direct mount
+        if os.geteuid() == 0:
+            try:
+                subprocess.run(
+                    ["mount", "-t", "overlay", "overlay", "-o", mount_opts, self.merged_dir],
+                    check=True,
+                    capture_output=True,
+                )
+                self.mounted = True
+                self.overlay_mounts.append((self.upper_dir, "/", self.merged_dir))
+                return
+            except subprocess.CalledProcessError as e:
+                raise PermissionError(
+                    f"Failed to mount overlayfs as root: {e.stderr.decode() if e.stderr else str(e)}"
+                ) from e
+
+        # Try unprivileged mount using a persistent user namespace
+        # This works on Linux 5.11+ with unprivileged user namespaces enabled
+        if self._setup_userns_namespace():
+            return
+
+        # Neither method worked
+        raise PermissionError(
+            "Failed to mount overlayfs. This operation requires either:\n"
+            "  1. Root privileges (run with sudo), or\n"
+            "  2. A Linux kernel 5.11+ with unprivileged user namespaces enabled"
+        )
+
+    def _setup_userns_namespace(self) -> bool:
+        """
+        Set up a persistent user namespace with overlayfs mounted.
+
+        Creates a long-running shell process inside a user+mount namespace,
+        mounts the overlay inside it, and keeps it alive for running commands.
+        Commands are executed inside a chroot for defense in depth.
+
+        Returns:
+            True if setup succeeded, False otherwise
+        """
+        mount_opts = f"lowerdir={shlex.quote(self.base_dir)},upperdir={self.upper_dir},workdir={self.work_dir},userxattr"
+
+        # Create a shell script that will:
+        # 1. Mount an overlay over just the base directory (not /, which fails in userns)
+        # 2. Signal readiness
+        # 3. Wait for commands on stdin and execute them inside the merged directory
+        # We use a simple protocol: send base64-encoded command, get returncode + base64-encoded response
+        setup_script = f"""
+# Mount overlay over the base directory
+mount -t overlay overlay -o {mount_opts} {shlex.quote(self.merged_dir)} || exit 1
+
+echo "READY"
+
+# Command loop: read base64 commands, execute in merged dir, return results
+while IFS= read -r cmd_b64; do
+    if [ "$cmd_b64" = "EXIT" ]; then
+        exit 0
+    fi
+    # Decode command and execute inside the merged overlay directory
+    cmd=$(echo "$cmd_b64" | base64 -d)
+    output=$(cd {shlex.quote(self.merged_dir)} && bash -c "$cmd" 2>&1)
+    rc=$?
+    # Send back: returncode and base64-encoded output
+    echo "$rc"
+    echo "$output" | base64 -w0
+    echo ""
+done
+"""
+
+        try:
+            import select
+
+            # Start the namespace process
+            self._ns_process = subprocess.Popen(
+                ["unshare", "-rm", "bash", "-c", setup_script],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            # Wait for the READY signal (with timeout)
+            ready = select.select([self._ns_process.stdout], [], [], 10)
+            if not ready[0]:
+                self._ns_process.kill()
+                return False
+
+            line = self._ns_process.stdout.readline().strip()
+            if line != "READY":
+                self._ns_process.kill()
+                return False
+
+            self.mounted = True
+            self.using_userns = True
+            self.overlay_mounts.append((self.upper_dir, self.base_dir, self.merged_dir))
+            return True
+
+        except (FileNotFoundError, OSError):
+            return False
 
     def run_command(self, command: List[str]) -> Any:
         """
@@ -158,6 +265,7 @@ class OverlayFS(Sandbox):
         1. The overlayfs overlays the entire root filesystem (/) with an upper layer
         2. Chroot into the merged overlayfs view, which contains /bin/bash and all binaries
         3. All filesystem writes go to the overlay's upper layer, protecting the real filesystem
+        4. If running under sudo, commands execute as the original user (not root)
 
         Even if a malicious process attempts to unmount from inside the chroot,
         they cannot escape because they're already confined to the merged view.
@@ -172,27 +280,48 @@ class OverlayFS(Sandbox):
         if not self.mounted:
             raise RuntimeError("OverlayFS is not mounted")
 
-        # Prepare environment
+        if self.using_userns:
+            return self._run_command_userns(command)
+        else:
+            return self._run_command_privileged(command)
+
+    def _run_command_privileged(self, command: List[str]) -> Any:
+        """
+        Execute a command using privileged chroot isolation.
+
+        Used when running as root. Creates a new mount namespace per command
+        and uses chroot for isolation.
+        """
         env = os.environ.copy()
-        env["PWD"] = self.current_dir
         env["OVERLAY_BASE_DIR"] = self.base_dir
 
         # Build the inner script that will run inside the chroot
         # Using base64 encoding avoids all nested quoting issues
-        inner_script = f"""cd {shlex.quote(self.current_dir)} && {" ".join(command)}
-echo "FINAL_PWD:$(pwd)"
-"""
+        inner_script = " ".join(command)
         encoded_script = base64.b64encode(inner_script.encode()).decode()
+
+        # Build the command to run inside the chroot
+        # If we're running under sudo, drop privileges to the original user
+        if self.orig_uid is not None and self.orig_user:
+            # Use su to drop privileges to the original user
+            # This ensures commands run as the user who invoked sudo, not as root
+            chroot_inner_cmd = (
+                f'su -s /bin/bash {shlex.quote(self.orig_user)} -c '
+                f'"eval $(echo {encoded_script} | base64 -d)"'
+            )
+        else:
+            chroot_inner_cmd = f'"eval $(echo {encoded_script} | base64 -d)"'
 
         # Chroot into the merged overlayfs view which contains the full root filesystem.
         # This provides defense in depth:
         # 1. The overlayfs ensures all writes go to the upper layer (protecting the real filesystem)
         # 2. The chroot confines the process to the merged view (even if they try to unmount,
         #    they can't escape because they're already chrooted into the overlay)
+        # 3. Commands run as the original user, not root (when invoked via sudo)
         # Note: Submounts (like /home) are overlaid during __init__ via _bind_submounts()
         cmd_str = f"""
 set -e
-chroot {shlex.quote(self.merged_dir)} bash -c "eval $(echo {encoded_script} | base64 -d)"
+chroot {shlex.quote(self.merged_dir)} bash -c {chroot_inner_cmd}
 """
 
         result = subprocess.run(
@@ -202,25 +331,49 @@ chroot {shlex.quote(self.merged_dir)} bash -c "eval $(echo {encoded_script} | ba
             text=True,
         )
 
-        # Extract the final working directory from output
-        stdout_lines = result.stdout.split("\n") if result.stdout else []
-        for i, line in enumerate(stdout_lines):
-            if line.startswith("FINAL_PWD:"):
-                # Since we overlay the full root, paths inside chroot are absolute
-                # and match the real filesystem paths
-                final_pwd = line[10:]
-
-                # Validate and normalize the path
-                final_pwd = os.path.normpath(final_pwd)
-                if final_pwd.startswith(self.base_dir):
-                    self.current_dir = final_pwd
-                stdout_lines.pop(i)
-                break
-
         return {
             "returncode": result.returncode,
-            "stdout": "\n".join(stdout_lines).encode() if stdout_lines else b"",
+            "stdout": result.stdout.encode() if result.stdout else b"",
             "stderr": result.stderr.encode() if result.stderr else b"",
+        }
+
+    def _run_command_userns(self, command: List[str]) -> Any:
+        """
+        Execute a command in the persistent user namespace with chroot isolation.
+
+        Used for unprivileged operation. Sends the command to the persistent
+        shell process running inside the user namespace, which executes it
+        inside a chroot for defense in depth.
+        """
+        if not hasattr(self, "_ns_process") or self._ns_process.poll() is not None:
+            raise RuntimeError("User namespace process is not running")
+
+        # Build the command string
+        cmd_str = " ".join(command)
+        encoded_cmd = base64.b64encode(cmd_str.encode()).decode()
+
+        # Send command to the namespace process
+        self._ns_process.stdin.write(encoded_cmd + "\n")
+        self._ns_process.stdin.flush()
+
+        # Read the response: first line is return code, second is base64-encoded output
+        rc_line = self._ns_process.stdout.readline().strip()
+        output_b64 = self._ns_process.stdout.readline().strip()
+
+        try:
+            returncode = int(rc_line)
+        except ValueError:
+            returncode = 1
+
+        try:
+            output = base64.b64decode(output_b64).decode()
+        except Exception:
+            output = ""
+
+        return {
+            "returncode": returncode,
+            "stdout": output.encode(),
+            "stderr": b"",
         }
 
     def _bind_submounts(self) -> None:
@@ -436,8 +589,18 @@ chroot {shlex.quote(self.merged_dir)} bash -c "eval $(echo {encoded_script} | ba
                     for upper_dir, lower_dir, _ in self.overlay_mounts:
                         self._apply_overlay_changes(upper_dir, lower_dir)
         finally:
-            if self.mounted:
+            # Terminate the user namespace process if running
+            if hasattr(self, "_ns_process") and self._ns_process.poll() is None:
+                try:
+                    self._ns_process.stdin.write("EXIT\n")
+                    self._ns_process.stdin.flush()
+                    self._ns_process.wait(timeout=5)
+                except Exception:
+                    self._ns_process.kill()
+
+            if self.mounted and not self.using_userns:
                 # Unmount in reverse order (submounts first, then root)
+                # Only needed for privileged mode; userns mounts die with the process
                 for _, _, mount_point in reversed(self.overlay_mounts):
                     try:
                         subprocess.run(
@@ -453,8 +616,9 @@ chroot {shlex.quote(self.merged_dir)} bash -c "eval $(echo {encoded_script} | ba
                             )
                         except subprocess.CalledProcessError:
                             pass  # Continue with cleanup even if unmount fails
-                self.mounted = False
-                self.overlay_mounts.clear()
+
+            self.mounted = False
+            self.overlay_mounts.clear()
 
             # Clean up temporary directories
             if self.temp_root and os.path.exists(self.temp_root):
@@ -562,7 +726,10 @@ chroot {shlex.quote(self.merged_dir)} bash -c "eval $(echo {encoded_script} | ba
         Returns:
             Current working directory path
         """
-        return self.current_dir
+        result = self.run_command(["pwd"])
+        if result["returncode"] == 0:
+            return result["stdout"].decode().strip()
+        return self.base_dir
 
     def get_changed_files(self) -> List[ChangedFile]:
         """

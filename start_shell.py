@@ -24,7 +24,6 @@ def main() -> None:
         prompter.run_interactive_session()
     except PermissionError as e:
         print(f"Error: {e}")
-        print("You may need to run this script with sudo privileges.")
         return
 
 
