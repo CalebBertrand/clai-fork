@@ -9,12 +9,14 @@ class Sandbox(ABC):
     """Abstract base class for sandbox environments that isolate command execution."""
 
     @abstractmethod
-    def run_command(self, command: List[str]) -> Any:
+    def run_command(self, command: "str | List[str]") -> Any:
         """
         Execute a command in the sandbox environment.
 
         Args:
-            command: List of command arguments to execute
+            command: Either a raw shell line (evaluated by the sandbox's shell,
+                so pipes, redirects and quoting all work) or a list of argv
+                tokens, which is joined with proper shell quoting.
 
         Returns:
             Result object with returncode, stdout, stderr

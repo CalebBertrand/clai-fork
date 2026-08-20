@@ -6,7 +6,7 @@ import sys
 from sandbox.overlayfs import OverlayFS
 
 
-def test_sensitive_directory_hiding():
+def test_sensitive_directory_hiding() -> bool:
     """Test that sensitive directories like ~/.ssh are properly hidden."""
 
     # Get the user's home directory
@@ -43,7 +43,7 @@ def test_sensitive_directory_hiding():
 
         # Test 2: Try to cd into ~/.ssh
         print("\nTest 2: Attempting to cd into ~/.ssh...")
-        result = sandbox.run_command(["cd", f"{home_dir}/.ssh", "&&", "pwd"])
+        result = sandbox.run_command(f"cd {home_dir}/.ssh && pwd")
         stderr = result["stderr"].decode() if result["stderr"] else ""
 
         if "No such file or directory" in stderr or "cannot access" in stderr:
@@ -54,7 +54,7 @@ def test_sensitive_directory_hiding():
 
         # Test 3: Try to cd via shell expansion
         print("\nTest 3: Attempting to cd ~/.ssh using shell expansion...")
-        result = sandbox.run_command(["bash", "-c", "cd ~/.ssh && pwd"])
+        result = sandbox.run_command("cd ~/.ssh && pwd")
         stderr = result["stderr"].decode() if result["stderr"] else ""
 
         if result["returncode"] != 0:
@@ -75,9 +75,7 @@ def test_sensitive_directory_hiding():
 
         # Test 5: Try escape attempt - umount
         print("\nTest 5: Attempting escape via umount (should fail due to chroot)...")
-        result = sandbox.run_command(
-            ["bash", "-c", f"umount {home_dir} && cd ~/.ssh && ls"]
-        )
+        result = sandbox.run_command(f"umount {home_dir} && cd ~/.ssh && ls")
         stderr = result["stderr"].decode() if result["stderr"] else ""
 
         if (

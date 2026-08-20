@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 Test script for the overlayfs runner functionality.
-run `sudo python3 -m CLAI.sandbox.test_runner` from the parent dir of the repo
+run `python3 -m sandbox.test_runner` from the repo root
 """
 
 import os
-from CLAI.sandbox.overlayfs import OverlayFS
-from CLAI.shell import Prompter
+from sandbox.overlayfs import OverlayFS
+from shell import Prompter
 
 
 def main() -> None:

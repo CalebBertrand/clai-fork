@@ -2,9 +2,9 @@
 # file: CLAI/llm/adapter_openai.py
 
 from __future__ import annotations
-from CLAI.prompt_builder.base_prompts import SYSTEM_PROMPT
-from CLAI.prompt_builder.few_shots import FEW_SHOTS
-from CLAI.prompt_builder.schemas.plan_v1 import (
+from prompt_builder.base_prompts import SYSTEM_PROMPT
+from prompt_builder.few_shots import FEW_SHOTS
+from prompt_builder.schemas.plan_v1 import (
     PLAN_JSON_SCHEMA,
     PLAN_FN_NAME,
     PLAN_VERSION,
@@ -12,7 +12,7 @@ from CLAI.prompt_builder.schemas.plan_v1 import (
 import json
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, cast
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -46,21 +46,23 @@ class OpenAITranslator:
             raise RuntimeError("Install the SDK: pip install openai>=1.40")
         self.client = OpenAI(base_url=base_url or os.environ.get("OPENAI_BASE_URL"))
         self.model = model or os.environ.get("CLAI_OPENAI_MODEL", "gpt-4.1-mini")
-        self.conversation_history = []
+        self.conversation_history: list[Dict[str, Any]] = []
 
     def translate(
         self, nl_request: str, extra_context: Optional[dict] = None
     ) -> TranslationResult:
-        messages = [
+        messages: List[Any] = [
             {"role": "system", "content": SYSTEM_PROMPT},
             *FEW_SHOTS,
             *self.conversation_history,
             {"role": "user", "content": self._format_user(nl_request, extra_context)},
         ]
 
+        # The SDK's message param types are far stricter than the plain dicts
+        # we assemble here; the shapes are correct at runtime.
         resp = self.client.chat.completions.create(
             model=self.model,
-            messages=messages,
+            messages=cast(Any, messages),
             tools=[
                 {
                     "type": "function",
@@ -121,7 +123,9 @@ class OpenAITranslator:
                     for tool_call in message.tool_calls:
                         if tool_call.function.name == PLAN_FN_NAME:
                             args = tool_call.function.arguments
-                            return json.loads(args) if isinstance(args, str) else args
+                            parsed = json.loads(args) if isinstance(args, str) else args
+                            if isinstance(parsed, dict):
+                                return parsed
         except Exception:
             pass
 

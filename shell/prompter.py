@@ -1,14 +1,15 @@
+import shlex
 import sys
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, Any, List, Optional
 
 from prompt_toolkit import PromptSession
 from rich.console import Console
 
-from CLAI.llm.translator import Translator
-from CLAI.shell.diff_display import display_changes
+from shell.diff_display import display_changes
 
 if TYPE_CHECKING:
-    from CLAI.sandbox import Sandbox, ChangedFile
+    from llm.translator import Translator
+    from sandbox import Sandbox, ChangedFile
 
 
 class Prompter:
@@ -25,10 +26,34 @@ class Prompter:
         self.sandbox = sandbox
         self.exit_sequence = exit_sequence
         self.session: PromptSession = PromptSession()
-        self.translator = Translator()
         self.console = Console()
+        # The translator is created lazily: it needs an OpenAI API key, and the
+        # plain sandboxed shell must stay usable without one.
+        self._translator: Optional["Translator"] = None
 
-    def _run_command(self, command: List[str]):
+    def _get_translator(self) -> "Translator":
+        """
+        Return the LLM translator, constructing it on first use.
+
+        Raises:
+            RuntimeError: If the translator cannot be constructed (e.g. no API key)
+        """
+        if self._translator is None:
+            from llm.translator import Translator
+
+            self._translator = Translator()
+        return self._translator
+
+    def _run_command(self, command: "str | List[str]") -> Any:
+        """
+        Run a command in the sandbox and echo its output to the terminal.
+
+        Args:
+            command: A raw shell line, or a list of argv tokens
+
+        Returns:
+            The sandbox result dict (returncode, stdout, stderr)
+        """
         result = self.sandbox.run_command(command)
 
         # Print stdout and stderr to terminal
@@ -70,7 +95,9 @@ class Prompter:
                     if user_input.startswith("/") and user_input != self.exit_sequence:
                         self._handle_ai_prompt(user_input[1:])  # Remove the leading /
                     else:
-                        self._run_command(user_input.split())
+                        # Pass the line through verbatim so quoting, pipes and
+                        # redirects behave the way they do in a normal shell.
+                        self._run_command(user_input)
 
                 except KeyboardInterrupt:
                     print(f"\nUse '{self.exit_sequence}' to exit.")
@@ -86,13 +113,12 @@ class Prompter:
             # Show diff before asking about changes
             display_changes(changed_files, self.console)
 
-            keep_changes = self._prompt_keep_changes()
+            # Nothing to decide about if the session made no changes
+            keep_changes = bool(changed_files) and self._prompt_keep_changes()
             self.sandbox.cleanup(keep_changes, changed_files)
 
-            if keep_changes:
-                print("Changes kept.")
-            else:
-                print("Changes discarded.")
+            if changed_files:
+                print("Changes kept." if keep_changes else "Changes discarded.")
 
         except Exception:
             if self.sandbox:
@@ -107,7 +133,17 @@ class Prompter:
             nl_prompt: The natural language prompt from the user
         """
         try:
-            plan = self.translator.to_plan(nl_prompt)
+            translator = self._get_translator()
+        except Exception as e:
+            print(f"AI prompting is unavailable: {e}")
+            print(
+                "Set OPENAI_API_KEY (in your environment or a .env file) to use "
+                "natural language prompting. Plain shell commands still work."
+            )
+            return
+
+        try:
+            plan = translator.to_plan(nl_prompt)
 
             print(f"\nExplanation: {plan.get('explain', 'No explanation provided')}")
 
@@ -115,30 +151,33 @@ class Prompter:
                 question = plan.get("question", "Additional clarification needed")
                 print(f"\nClarification needed: {question}")
                 # Add clarification to conversation history
-                self.translator.add_execution_context(
-                    f"Clarification needed: {question}"
-                )
+                translator.add_execution_context(f"Clarification needed: {question}")
                 return
 
             command = plan.get("command", [])
             if command:
-                print(f"Executing: {' '.join(command)}")
+                display = shlex.join(command)
+                print(f"Executing: {display}")
                 result = self._run_command(command)
 
-                execution_info = f"Command executed: {' '.join(command)}"
-                if hasattr(result, "returncode"):
-                    execution_info += f" (exit code: {result.returncode})"
-                self.translator.add_execution_context(execution_info)
+                execution_info = f"Command executed: {display}"
+                returncode = result.get("returncode") if result else None
+                if returncode is not None:
+                    execution_info += f" (exit code: {returncode})"
+                translator.add_execution_context(execution_info)
             else:
                 print("No command generated")
-                self.translator.add_execution_context(
+                translator.add_execution_context(
                     "No command was generated from the request"
                 )
 
         except Exception as e:
             error_msg = f"AI translation error: {e}"
             print(error_msg)
-            self.translator.add_execution_context(error_msg)
+            try:
+                translator.add_execution_context(error_msg)
+            except Exception:
+                pass
 
     def _show_welcome_banner(self) -> None:
         """Display a welcome banner for the CLAI shell."""
@@ -183,6 +222,7 @@ class Prompter:
                     return False
                 else:
                     print("Please enter 'y' or 'n'.")
-            except KeyboardInterrupt:
-                print("\nChanges discarded.")
+            except (KeyboardInterrupt, EOFError):
+                # Ctrl+C or Ctrl+D at the prompt: default to the safe answer
+                print()
                 return False

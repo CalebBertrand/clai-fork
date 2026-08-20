@@ -7,10 +7,9 @@ from typing import List
 
 from rich.console import Console
 from rich.panel import Panel
-from rich.syntax import Syntax
 from rich.text import Text
 
-from CLAI.sandbox import ChangedFile, ChangeType
+from sandbox import ChangedFile, ChangeType
 
 
 def display_changes(changed_files: List[ChangedFile], console: Console | None = None) -> None:
@@ -157,16 +156,21 @@ def _print_colored_diff(diff_lines: List[str], console: Console) -> None:
 
         if line.startswith("+++") or line.startswith("---"):
             # File header lines
-            console.print(f"[bold]{line}[/bold]")
+            style = "bold"
         elif line.startswith("@@"):
             # Hunk header
-            console.print(f"[cyan]{line}[/cyan]")
+            style = "cyan"
         elif line.startswith("+"):
             # Added line
-            console.print(f"[green]{line}[/green]")
+            style = "green"
         elif line.startswith("-"):
             # Removed line
-            console.print(f"[red]{line}[/red]")
+            style = "red"
         else:
             # Context line
-            console.print(f"[dim]{line}[/dim]")
+            style = "dim"
+
+        # Render as Text rather than a markup string: file contents may
+        # legitimately contain square brackets, which Rich would otherwise
+        # try to interpret as markup tags.
+        console.print(Text(line, style=style))

@@ -84,6 +84,16 @@ DEFAULT_SENSITIVE_PATHS = [
 ]
 
 
+def _decode_b64(data: str) -> bytes:
+    """Decode a base64 payload from the sandbox, tolerating empty/corrupt input."""
+    if not data:
+        return b""
+    try:
+        return base64.b64decode(data)
+    except Exception:
+        return b""
+
+
 class OverlayFS(Sandbox):
     """Handles overlayfs mounting and command execution in an isolated environment."""
 
@@ -106,6 +116,11 @@ class OverlayFS(Sandbox):
         self.upper_dir = os.path.join(self.temp_root, "upper")
         self.work_dir = os.path.join(self.temp_root, "work")
         self.merged_dir = os.path.join(self.temp_root, "merged")
+        # Where commands actually see the overlay. Privileged mode mounts the
+        # merged view under temp_root; unprivileged mode mounts the overlay
+        # over base_dir itself inside a private mount namespace, so paths look
+        # exactly like the real ones to anything running in the sandbox.
+        self.mount_point = self.merged_dir
         self.hidden_paths: Set[str] = set()
         # Track all overlay mounts: list of (upper_dir, lower_dir, mount_point) tuples
         # Used during cleanup to apply changes from each overlay
@@ -191,38 +206,65 @@ class OverlayFS(Sandbox):
         Set up a persistent user namespace with overlayfs mounted.
 
         Creates a long-running shell process inside a user+mount namespace,
-        mounts the overlay inside it, and keeps it alive for running commands.
-        Commands are executed inside a chroot for defense in depth.
+        mounts the overlay over base_dir inside it, and keeps it alive so that
+        successive commands share one shell (and therefore one working
+        directory, one set of shell variables, and so on).
+
+        Note: unlike the privileged path, this overlays only base_dir rather
+        than the whole root filesystem, so writes outside base_dir are NOT
+        captured by the overlay. See run_command() for the full caveat.
 
         Returns:
             True if setup succeeded, False otherwise
         """
         mount_opts = f"lowerdir={shlex.quote(self.base_dir)},upperdir={self.upper_dir},workdir={self.work_dir},userxattr"
 
+        # Mount the overlay over base_dir itself. We are inside a private mount
+        # namespace, so this is invisible to the rest of the system, and it
+        # means commands in the sandbox see their real paths rather than an
+        # internal /tmp/overlay_* path.
+        self.mount_point = self.base_dir
+
+        # Paths used by the command loop to capture each command's streams
+        # separately. They live in temp_root, which is outside the overlay.
+        out_file = os.path.join(self.temp_root, "cmd_stdout")
+        err_file = os.path.join(self.temp_root, "cmd_stderr")
+
         # Create a shell script that will:
         # 1. Mount an overlay over just the base directory (not /, which fails in userns)
-        # 2. Signal readiness
-        # 3. Wait for commands on stdin and execute them inside the merged directory
-        # We use a simple protocol: send base64-encoded command, get returncode + base64-encoded response
+        # 2. cd into the merged view and signal readiness
+        # 3. Serve commands from stdin, one per line, in that same shell
+        #
+        # The command is evaluated in the loop's own shell rather than a
+        # subshell so that state such as `cd` persists between commands, which
+        # is what makes this behave like a shell rather than a series of
+        # unrelated one-shot executions.
+        #
+        # Protocol, per command: we send one base64-encoded line (or the
+        # literal "EXIT"), and read back three lines - the return code, the
+        # base64-encoded stdout, and the base64-encoded stderr. base64 keeps
+        # arbitrary binary output and embedded newlines on a single line.
         setup_script = f"""
 # Mount overlay over the base directory
-mount -t overlay overlay -o {mount_opts} {shlex.quote(self.merged_dir)} || exit 1
+mount -t overlay overlay -o {mount_opts} {shlex.quote(self.mount_point)} || exit 1
+
+# Start inside the overlaid directory; this cwd persists across commands
+cd {shlex.quote(self.mount_point)} || exit 1
 
 echo "READY"
 
-# Command loop: read base64 commands, execute in merged dir, return results
 while IFS= read -r cmd_b64; do
     if [ "$cmd_b64" = "EXIT" ]; then
         exit 0
     fi
-    # Decode command and execute inside the merged overlay directory
-    cmd=$(echo "$cmd_b64" | base64 -d)
-    output=$(cd {shlex.quote(self.merged_dir)} && bash -c "$cmd" 2>&1)
+    cmd=$(printf '%s' "$cmd_b64" | base64 -d)
+    # Redirect stdin from /dev/null so a command cannot consume the command
+    # stream we are reading from.
+    eval "$cmd" > {shlex.quote(out_file)} 2> {shlex.quote(err_file)} < /dev/null
     rc=$?
-    # Send back: returncode and base64-encoded output
-    echo "$rc"
-    echo "$output" | base64 -w0
-    echo ""
+    printf '%s\\n' "$rc"
+    base64 -w0 < {shlex.quote(out_file)}; printf '\\n'
+    base64 -w0 < {shlex.quote(err_file)}; printf '\\n'
 done
 """
 
@@ -238,40 +280,74 @@ done
                 text=True,
             )
 
+            ns_stdout = self._ns_process.stdout
+            if ns_stdout is None:
+                self._ns_process.kill()
+                return False
+
             # Wait for the READY signal (with timeout)
-            ready = select.select([self._ns_process.stdout], [], [], 10)
+            ready = select.select([ns_stdout], [], [], 10)
             if not ready[0]:
                 self._ns_process.kill()
                 return False
 
-            line = self._ns_process.stdout.readline().strip()
-            if line != "READY":
+            if ns_stdout.readline().strip() != "READY":
                 self._ns_process.kill()
                 return False
 
             self.mounted = True
             self.using_userns = True
-            self.overlay_mounts.append((self.upper_dir, self.base_dir, self.merged_dir))
+            self.overlay_mounts.append(
+                (self.upper_dir, self.base_dir, self.mount_point)
+            )
             return True
 
         except (FileNotFoundError, OSError):
             return False
 
-    def run_command(self, command: List[str]) -> Any:
+    @staticmethod
+    def _to_shell_line(command: "str | List[str]") -> str:
         """
-        Execute a command in the overlay environment using chroot isolation.
+        Normalise a command into a single shell line.
 
-        Security approach (defense in depth):
-        1. The overlayfs overlays the entire root filesystem (/) with an upper layer
-        2. Chroot into the merged overlayfs view, which contains /bin/bash and all binaries
-        3. All filesystem writes go to the overlay's upper layer, protecting the real filesystem
-        4. If running under sudo, commands execute as the original user (not root)
-
-        Even if a malicious process attempts to unmount from inside the chroot,
-        they cannot escape because they're already confined to the merged view.
+        A string is passed through untouched, so the caller can use the full
+        shell grammar (pipes, redirects, quoting, &&). A list is treated as an
+        argv vector and joined with shlex.quote, so arguments containing
+        spaces or metacharacters survive intact rather than being re-split.
 
         Args:
-            command: List of command arguments to execute
+            command: A raw shell line, or a list of argv tokens
+        Returns:
+            A shell line ready to be evaluated by bash
+        """
+        if isinstance(command, str):
+            return command
+        return shlex.join(command)
+
+    def run_command(self, command: "str | List[str]") -> Any:
+        """
+        Execute a command in the overlay environment.
+
+        Accepts either a raw shell line (evaluated by bash, so pipes,
+        redirects and quoting all work) or a list of argv tokens (joined with
+        proper quoting).
+
+        Isolation depends on how the overlay was mounted:
+
+        Privileged mode (running as root) - the overlay covers the entire root
+        filesystem, the command runs chrooted into the merged view, and every
+        write anywhere on the filesystem lands in the upper layer. If running
+        under sudo, commands execute as the original user, not root.
+
+        Unprivileged mode (user namespace) - the overlay covers base_dir only.
+        Writes under base_dir are captured by the upper layer and can be
+        reviewed and rolled back, but paths OUTSIDE base_dir are the real
+        filesystem and are not protected. There is no chroot in this mode
+        because the merged view contains only base_dir, not a root filesystem
+        to chroot into.
+
+        Args:
+            command: A raw shell line, or a list of argv tokens
         Returns:
             Dictionary with returncode, stdout, stderr
         Raises:
@@ -285,7 +361,7 @@ done
         else:
             return self._run_command_privileged(command)
 
-    def _run_command_privileged(self, command: List[str]) -> Any:
+    def _run_command_privileged(self, command: "str | List[str]") -> Any:
         """
         Execute a command using privileged chroot isolation.
 
@@ -297,7 +373,7 @@ done
 
         # Build the inner script that will run inside the chroot
         # Using base64 encoding avoids all nested quoting issues
-        inner_script = " ".join(command)
+        inner_script = self._to_shell_line(command)
         encoded_script = base64.b64encode(inner_script.encode()).decode()
 
         # Build the command to run inside the chroot
@@ -337,43 +413,45 @@ chroot {shlex.quote(self.merged_dir)} bash -c {chroot_inner_cmd}
             "stderr": result.stderr.encode() if result.stderr else b"",
         }
 
-    def _run_command_userns(self, command: List[str]) -> Any:
+    def _run_command_userns(self, command: "str | List[str]") -> Any:
         """
-        Execute a command in the persistent user namespace with chroot isolation.
+        Execute a command in the persistent user namespace.
 
-        Used for unprivileged operation. Sends the command to the persistent
-        shell process running inside the user namespace, which executes it
-        inside a chroot for defense in depth.
+        Used for unprivileged operation. Sends the command to the long-running
+        shell inside the user namespace, which evaluates it in its own shell so
+        that working directory and other shell state persist between calls.
         """
         if not hasattr(self, "_ns_process") or self._ns_process.poll() is not None:
             raise RuntimeError("User namespace process is not running")
 
-        # Build the command string
-        cmd_str = " ".join(command)
+        stdin = self._ns_process.stdin
+        stdout = self._ns_process.stdout
+        if stdin is None or stdout is None:
+            raise RuntimeError("User namespace process has no command channel")
+
+        cmd_str = self._to_shell_line(command)
         encoded_cmd = base64.b64encode(cmd_str.encode()).decode()
 
         # Send command to the namespace process
-        self._ns_process.stdin.write(encoded_cmd + "\n")
-        self._ns_process.stdin.flush()
+        stdin.write(encoded_cmd + "\n")
+        stdin.flush()
 
-        # Read the response: first line is return code, second is base64-encoded output
-        rc_line = self._ns_process.stdout.readline().strip()
-        output_b64 = self._ns_process.stdout.readline().strip()
+        # Read the response: return code, base64 stdout, base64 stderr
+        rc_line = stdout.readline()
+        if not rc_line:
+            raise RuntimeError("User namespace process exited unexpectedly")
+        out_b64 = stdout.readline().strip()
+        err_b64 = stdout.readline().strip()
 
         try:
-            returncode = int(rc_line)
+            returncode = int(rc_line.strip())
         except ValueError:
             returncode = 1
 
-        try:
-            output = base64.b64decode(output_b64).decode()
-        except Exception:
-            output = ""
-
         return {
             "returncode": returncode,
-            "stdout": output.encode(),
-            "stderr": b"",
+            "stdout": _decode_b64(out_b64),
+            "stderr": _decode_b64(err_b64),
         }
 
     def _bind_submounts(self) -> None:
@@ -592,8 +670,9 @@ chroot {shlex.quote(self.merged_dir)} bash -c {chroot_inner_cmd}
             # Terminate the user namespace process if running
             if hasattr(self, "_ns_process") and self._ns_process.poll() is None:
                 try:
-                    self._ns_process.stdin.write("EXIT\n")
-                    self._ns_process.stdin.flush()
+                    if self._ns_process.stdin is not None:
+                        self._ns_process.stdin.write("EXIT\n")
+                        self._ns_process.stdin.flush()
                     self._ns_process.wait(timeout=5)
                 except Exception:
                     self._ns_process.kill()
@@ -723,13 +802,29 @@ chroot {shlex.quote(self.merged_dir)} bash -c {chroot_inner_cmd}
         """
         Get the current working directory visible in the sandbox.
 
+        The merged overlay lives under a temporary directory, so the raw path
+        is translated back to the equivalent path under base_dir. That keeps
+        the shell prompt showing where the user thinks they are rather than
+        an internal /tmp/overlay_* path.
+
         Returns:
             Current working directory path
         """
         result = self.run_command(["pwd"])
-        if result["returncode"] == 0:
-            return result["stdout"].decode().strip()
-        return self.base_dir
+        if result["returncode"] != 0:
+            return self.base_dir
+
+        pwd = str(result["stdout"].decode(errors="replace")).strip()
+        if not pwd:
+            return self.base_dir
+
+        merged = self.mount_point.rstrip("/")
+        if pwd == merged:
+            return self.base_dir
+        if pwd.startswith(merged + "/"):
+            return os.path.join(self.base_dir, pwd[len(merged) + 1 :])
+        # cwd is outside the overlay (the user cd'd away); report it as-is
+        return pwd
 
     def get_changed_files(self) -> List[ChangedFile]:
         """
